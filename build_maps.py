@@ -59,6 +59,9 @@ def family_files(rel):
     return None
 
 ALL = set(idnum.values())
+SLOW_PARSE = {idnum["tests/test_parser.py::TestParser::test_max_nodes"]}
+PARSE_CORE = {"sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
+              "sqlglot/errors.py", "sqlglot/helper.py", "sqlglot/__init__.py", "sqlglot/_typing.py"}
 _inst = json.load(open("/tmp/inst.json"))
 IMPORT_CLASSES = set(_inst.pop("IMPORT", []))
 INST = defaultdict(set)
@@ -68,6 +71,13 @@ for tid, names in _inst.items():
 # classes whose arg_types other modules read at import or by name
 ARG_TYPES_READ = {"Select", "TableFromRows", "MakeInterval"}
 
+_dq = json.load(open("/tmp/dial2.json"))
+DQ_IMPORT = {n for n in _dq.pop("IMPORT", []) if ":" in n}
+DQ = defaultdict(set)
+for tid, ms in _dq.items():
+    if tid in idnum:
+        for n in ms:
+            if ":" in n: DQ[n].add(idnum[tid])
 _dial = json.load(open("/tmp/dial.json"))
 DIAL_IMPORT = set(_dial.pop("IMPORT", []))
 DIAL = {}
@@ -144,6 +154,21 @@ def analyze(rel):
             vf(ch, nf)
     vf(tree, None)
 
+    modname = rel[:-3].replace("/", ".")
+    qual_of = {}
+    def vq(node, prefix):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, ast.ClassDef):
+                q = f"{prefix}.{ch.name}" if prefix else ch.name
+                for l in range(ch.lineno, ch.end_lineno + 1): qual_of[l] = q
+                vq(ch, q)
+            elif isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            else:
+                vq(ch, prefix)
+    vq(tree, "")
+    lambdas = sorted(((nd.lineno, nd.end_lineno) for nd in ast.walk(tree) if isinstance(nd, ast.Lambda)),
+                     key=lambda x: x[1] - x[0])
     argt = []  # (lo, hi, tests) for arg_types assignments in expression classes
     if rel.startswith("sqlglot/expressions/"):
         modname = rel[:-3].replace("/", ".")
@@ -160,10 +185,17 @@ def analyze(rel):
                         ts = INST.get(q, set())
                     argt.append((st.lineno, st.end_lineno, ts))
 
-    def static_set(rel):
+    def static_set(rel, line=None):
         # import-time code: dialect families use the family's tests, leaf
         # optimizer/executor modules their file's, shared modules every test
         fam = family_files(rel)
+        q = qual_of.get(line) if line is not None else None
+        if fam and q:
+            key = f"{modname}:{q}"
+            if key in DQ_IMPORT:
+                return ALL
+            if DQ.get(key):
+                return set(DQ[key])
         if fam:
             u = set()
             for ff in fam:
@@ -179,7 +211,9 @@ def analyze(rel):
             return u or ALL
         if rel.startswith(("sqlglot/optimizer/", "sqlglot/executor/")) and not rel.endswith("__init__.py"):
             return file_union or ALL
-        return ALL
+        if rel in PARSE_CORE:
+            return ALL
+        return ALL - SLOW_PARSE
 
     def rt(l):
         e = cov.get(l); return e[0] if e else set()
@@ -195,6 +229,9 @@ def analyze(rel):
 
     def mod(l):
         s0 = stmt_start.get(l, l)
+        for lo, hi in lambdas:
+            if lo <= l <= hi:
+                return union_range(lo, hi)
         T = set(rt(l)) | set(rt(s0))
         if l in stmt_end:
             T |= union_range(s0, stmt_end[l])
@@ -208,7 +245,7 @@ def analyze(rel):
             for lo, hi, ts in argt:
                 if lo <= l <= hi:
                     return ts
-            return static_set(rel)
+            return static_set(rel, l)
         return set()
 
     def ins(n):
@@ -233,7 +270,7 @@ def analyze(rel):
         for lo, hi, ts in argt:
             if lo <= n < hi:
                 return ts
-        return static_set(rel)
+        return static_set(rel, n if (qual_of.get(n) and qual_of.get(n) == qual_of.get(n + 1)) else None)
 
     m = {}; i = {}
     for l in range(1, nlines):
@@ -260,13 +297,42 @@ for p in sorted(glob.glob(SRC + "/sqlglot/**/*.py", recursive=True)):
     rel = os.path.relpath(p, SRC)
     out["files"][rel] = analyze(rel)
 
+# source text of each TestExecutor method plus the helpers it calls, to see
+# which of them read the tpch / tpcds data that setUpClass loads
+_ex = ast.parse(open(SRC + "/tests/test_executor.py").read())
+_meth = {}
+for c in _ex.body:
+    if isinstance(c, ast.ClassDef):
+        for f in c.body:
+            if isinstance(f, ast.FunctionDef):
+                _meth[f.name] = ast.unparse(f)
+def _closure(name, seen=None):
+    seen = seen or set()
+    if name in seen: return ""
+    seen.add(name); txt = _meth.get(name, "")
+    for other in _meth:
+        if f"self.{other}(" in txt: txt += _closure(other, seen)
+    return txt
+TPC_USERS = {}
+for i, n in idnum.items():
+    if i.startswith("tests/test_executor.py::TestExecutor::"):
+        txt = _meth.get(i.rsplit("::", 1)[1], "")
+        TPC_USERS[n] = " ".join(w for w in ("tpch", "tpcds") if w in txt or (w == "tpch" and "cached_execute(" in txt and "tpch=False" not in txt))
 opens = json.load(open("/tmp/opens2.json"))
 fx = defaultdict(set)
 for tid, fs in opens.items():
     if tid.startswith("SETUP "):
-        # class-level setup (setUpClass): every test of that class uses it
+        # class-level setup (setUpClass): the tests of that class that use it
         cls = tid[6:].rsplit("::", 1)[0] + "::"
         nums = {n for i, n in idnum.items() if i.startswith(cls)}
+        TPC = {"tpc-h": "tpch", "tpc-ds": "tpcds"}
+        for f in fs:
+            key = next((v for k, v in TPC.items() if f"/{k}/" in f), None)
+            if key:
+                fx[f] |= {n for n in nums if key in TPC_USERS.get(n, "")}
+            else:
+                fx[f] |= nums
+        continue
     else:
         nums = {idnum[tid]} if tid in idnum else set()
     for f in fs:

@@ -127,6 +127,35 @@ def same_ast(old_text, new_text):
         return False
 
 
+class _IsToEq(ast.NodeTransformer):
+    """`x is None` / `x is Enum.MEMBER` behave like `==` for sqlglot's types."""
+
+    @staticmethod
+    def _plain(node):
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True
+        return isinstance(node, ast.Attribute) and node.attr.isupper()
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and (self._plain(node.comparators[0]) or self._plain(node.left)):
+            op = node.ops[0]
+            if isinstance(op, ast.Is):
+                node.ops = [ast.Eq()]
+            elif isinstance(op, ast.IsNot):
+                node.ops = [ast.NotEq()]
+        return node
+
+
+def equivalent(old_text, new_text):
+    try:
+        a = _IsToEq().visit(ast.parse(old_text))
+        b = _IsToEq().visit(ast.parse(new_text))
+    except (SyntaxError, ValueError):
+        return False
+    return ast.dump(a) == ast.dump(b)
+
+
 def is_comment(text):
     s = text.strip()
     return s == "" or s.startswith("#")
@@ -188,7 +217,9 @@ class Selector:
                 return set()
             if same is None:
                 log(path, "does not compile: all tests")
-                return set(self.all)
+                return set(self.all) | {-1}
+            if equivalent(old, apply(old, hunks)):
+                return set()
         fm = self.files.get(path)
         if fm is None:
             return set(self.all)
