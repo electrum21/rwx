@@ -19,6 +19,11 @@ HERE = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("SRC_DIR", HERE / "src"))
 MAX_WORKERS = 8
 WORKER_COST = 2.0
+# Diagnostic builds only: commits whose selection used one of these rules
+# print no tests, so the board's misses and seconds measure those rules.
+PROBE_BLANK = set()
+WIDE = {"compile_fail", "unknown_pkg_file", "static_all", "test_helper", "testfile_whole",
+        "testfile_method", "fixture_guess", "unknown_path", "error"}
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 NO_EFFECT = re.compile(
     r"^(\.github/|posts/|benchmarks/|pdoc/|docs/|sqlglotc/|sqlglot-integration-tests/)"
@@ -186,7 +191,11 @@ def split(tests, secs):
 
 
 class Selector:
+    def tag(self, name):
+        self.tags.add(name)
+
     def __init__(self):
+        self.tags = set()
         tests = json.loads((DATA / "tests.json").read_text())["tests"]
         self.secs = {t["number"]: t["seconds"] for t in tests}
         self.all = set(self.secs)
@@ -217,11 +226,13 @@ class Selector:
                 return set()
             if same is None:
                 log(path, "does not compile: all tests")
-                return set(self.all) | {-1}
+                self.tag("compile_fail")
+                return set(self.all)
             if equivalent(old, apply(old, hunks)):
                 return set()
         fm = self.files.get(path)
         if fm is None:
+            self.tag("unknown_pkg_file")
             return set(self.all)
         m, ins, spans = fm["m"], fm["i"], fm.get("s", [])
         chosen = set()
@@ -237,11 +248,15 @@ class Selector:
                 s = m.get(str(ln))
                 if s:
                     got.update(self.sets[s])
+                    if len(self.sets[s]) >= 1500:
+                        self.tag("static_all")
             if code_added or stringy or not removed:
                 for p in (point, point + len(removed)):
                     s = ins.get(str(p))
                     if s:
                         got.update(self.sets[s])
+                        if len(self.sets[s]) >= 1500:
+                            self.tag("static_all")
             chosen |= got
         return chosen
 
@@ -257,6 +272,7 @@ class Selector:
         mine = self.by_file.get(path)
         if not mine or same is None:
             # helpers, __init__, conftest or a file that no longer imports
+            self.tag("test_helper" if not mine else "testfile_whole")
             return set(self.all) if not mine else set(mine)
         # changes inside one test method select that test; anything else the file
         tree = ast.parse(old)
@@ -277,12 +293,16 @@ class Selector:
             if hit and hit in self.by_id:
                 chosen.add(self.by_id[hit])
             else:
+                self.tag("testfile_whole")
                 return set(mine)
+        self.tag("testfile_method")
         return chosen
 
     def fixture(self, path):
         if path in self.fixtures:
+            self.tag("fixture")
             return set(self.fixtures[path])
+        self.tag("fixture_guess")
         # a fixture the map never saw read: every test file that names it
         stem = Path(path).name
         chosen = set()
@@ -293,6 +313,7 @@ class Selector:
         return chosen or set(self.all)
 
     def select(self, patch_text):
+        self.tags = set()
         chosen = set()
         for path, hunks in parse_patch(patch_text).items():
             if path is None:
@@ -307,6 +328,7 @@ class Selector:
                 continue
             else:
                 # setup.py, pyproject.toml, setup.cfg, conftest and the unknown
+                self.tag("unknown_path")
                 chosen |= self.all
         return chosen & self.all
 
@@ -318,8 +340,13 @@ def main():
             chosen = sel.select(patch_file.read_text(encoding="utf-8", errors="replace"))
         except Exception as error:  # never crash a run: be safe instead
             log(patch_file.stem, "error", repr(error))
+            sel.tags = {"error"}
             chosen = set(sel.all)
         workers = split(sorted(chosen), sel.secs) if chosen else []
+        if workers and max(sum(sel.secs[n] for n in w) for w in workers) + WORKER_COST * len(workers) >= 15:
+            sel.tags.add("cost15" if not (sel.tags & WIDE) else "wide_cost15")
+        if PROBE_BLANK & sel.tags:
+            workers = []
         print(json.dumps({"commit": patch_file.stem, "workers": workers}))
 
 
