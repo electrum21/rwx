@@ -55,6 +55,16 @@ def family_files(rel):
         return [f"sqlglot/{d}/{m}.py" for m in descendants(x) for d in FAMDIRS]
     return None
 
+ALL = set(idnum.values())
+_inst = json.load(open("/tmp/inst.json"))
+IMPORT_CLASSES = set(_inst.pop("IMPORT", []))
+INST = defaultdict(set)
+for tid, names in _inst.items():
+    if tid in idnum:
+        for n in names: INST[n].add(idnum[tid])
+# classes whose arg_types other modules read at import or by name
+ARG_TYPES_READ = {"Select", "TableFromRows", "MakeInterval"}
+
 class Info:
     pass
 
@@ -121,6 +131,35 @@ def analyze(rel):
             vf(ch, nf)
     vf(tree, None)
 
+    argt = []  # (lo, hi, tests) for arg_types assignments in expression classes
+    if rel.startswith("sqlglot/expressions/"):
+        modname = rel[:-3].replace("/", ".")
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for st in cls.body:
+                tgt = st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else getattr(st, "target", None)
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(tgt, ast.Name) and tgt.id == "arg_types":
+                    q = f"{modname}.{cls.name}"
+                    if q in IMPORT_CLASSES or cls.name in ARG_TYPES_READ:
+                        ts = ALL
+                    else:
+                        ts = INST.get(q, set())
+                    argt.append((st.lineno, st.end_lineno, ts))
+
+    def static_set(rel):
+        # import-time code: dialect families use the family's tests, leaf
+        # optimizer/executor modules their file's, shared modules every test
+        fam = family_files(rel)
+        if fam:
+            u = set()
+            for ff in fam:
+                for e in raw.get(ff, {}).values(): u |= e[0]
+            return u or ALL
+        if rel.startswith(("sqlglot/optimizer/", "sqlglot/executor/")) and not rel.endswith("__init__.py"):
+            return file_union or ALL
+        return ALL
+
     def rt(l):
         e = cov.get(l); return e[0] if e else set()
     def covered(l):
@@ -145,13 +184,10 @@ def analyze(rel):
             return T
         stat = (l in cov and cov[l][1]) or (s0 in cov and cov[s0][1])
         if stat:
-            c = class_of.get(l)
-            u = union_range(*c) if c else set()
-            fam = family_files(rel)
-            if fam:
-                for ff in fam:
-                    for e in raw.get(ff, {}).values(): u |= e[0]
-            return u or file_union
+            for lo, hi, ts in argt:
+                if lo <= l <= hi:
+                    return ts
+            return static_set(rel)
         return set()
 
     def ins(n):
@@ -173,13 +209,10 @@ def analyze(rel):
             if prev is None and nxt is None: return set()
             return s
         # module / class level static insertion
-        c = class_of.get(n)
-        u = union_range(*c) if (c and n < c[1]) else set()
-        fam = family_files(rel)
-        if fam:
-            for ff in fam:
-                for e in raw.get(ff, {}).values(): u |= e[0]
-        return u or file_union
+        for lo, hi, ts in argt:
+            if lo <= n < hi:
+                return ts
+        return static_set(rel)
 
     m = {}; i = {}
     for l in range(1, nlines):
@@ -188,19 +221,35 @@ def analyze(rel):
     for n in range(0, nlines):
         a = sid(ins(n))
         if a: i[n] = a
-    return {"m": m, "i": i}
+    spans = []
+    docs = set()
+    for nd in ast.walk(tree):
+        if isinstance(nd, ast.Expr) and isinstance(nd.value, ast.Constant) and isinstance(nd.value.value, str):
+            docs.add(id(nd.value))
+    for nd in ast.walk(tree):
+        if isinstance(nd, (ast.Constant, ast.JoinedStr)) and id(nd) not in docs:
+            if isinstance(nd, ast.Constant) and not isinstance(nd.value, (str, bytes)):
+                continue
+            if nd.end_lineno > nd.lineno:
+                spans.append([nd.lineno, nd.end_lineno])
+    return {"m": m, "i": i, "s": spans}
 
 import glob, os
 for p in sorted(glob.glob(SRC + "/sqlglot/**/*.py", recursive=True)):
     rel = os.path.relpath(p, SRC)
     out["files"][rel] = analyze(rel)
 
-opens = json.load(open("/tmp/opens.json"))
+opens = json.load(open("/tmp/opens2.json"))
 fx = defaultdict(set)
 for tid, fs in opens.items():
-    if tid in idnum:
-        for f in fs:
-            fx[f].add(idnum[tid])
+    if tid.startswith("SETUP "):
+        # class-level setup (setUpClass): every test of that class uses it
+        cls = tid[6:].rsplit("::", 1)[0] + "::"
+        nums = {n for i, n in idnum.items() if i.startswith(cls)}
+    else:
+        nums = {idnum[tid]} if tid in idnum else set()
+    for f in fs:
+        fx[f] |= nums
 out["fixtures"] = {k: sorted(v) for k, v in fx.items()}
 out["sets"] = sets
 json.dump(out, gzip.open("/home/claude/work/maps.json.gz", "wt", compresslevel=9), separators=(",", ":"))
