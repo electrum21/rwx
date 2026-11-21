@@ -25,7 +25,10 @@ WIDE_A = {"compile_fail", "unknown_pkg_file", "static_all", "test_helper", "test
           "testfile_method", "fixture_guess", "unknown_path", "error"}
 WIDE = {"compile_fail", "unknown_pkg_file", "static_all", "test_helper", "testfile_whole",
         "testfile_method", "fixture_guess", "unknown_path", "error"}
-PROBE_BLANK = set(WIDE_A)  # PROBE A
+PROBE_BLANK = set()  # never blank a commit: blanking a commit that has failing
+                     # tests is a guaranteed 300 s miss. Coverage selection is
+                     # always the safe fallback. (The old PROBE_A behaviour of
+                     # blanking wide-tagged commits was diagnostic only.)
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 NO_EFFECT = re.compile(
     r"^(\.github/|posts/|benchmarks/|pdoc/|docs/|sqlglotc/|sqlglot-integration-tests/)"
@@ -175,8 +178,36 @@ def in_string(spans, line, insertion):
     return False
 
 
+def _balance(groups, loads, secs):
+    """Local search: move single tests between workers to reduce max load."""
+    improved = True
+    while improved:
+        improved = False
+        i_max = max(range(len(groups)), key=lambda i: loads[i])
+        if not groups[i_max]:
+            break
+        # try moving each test of the busiest worker to another worker
+        for n in list(groups[i_max]):
+            best_i, best_load = None, None
+            for j in range(len(groups)):
+                if j == i_max:
+                    continue
+                new_load = loads[j] + secs[n]
+                if best_load is None or new_load < best_load:
+                    best_load = new_load
+                    best_i = j
+            if best_i is not None and best_load < loads[i_max]:
+                groups[i_max].remove(n)
+                groups[best_i].append(n)
+                loads[i_max] -= secs[n]
+                loads[best_i] += secs[n]
+                improved = True
+                break
+
+
 def split(tests, secs):
-    """Best of k = 1..8 workers by (largest load + 2k), longest test first."""
+    """Best of k = 1..8 workers by (largest load + 2k), longest test first,
+    with a local-search balancing pass to shave the busiest worker."""
     order = sorted(tests, key=lambda n: secs[n], reverse=True)
     best = None
     for k in range(1, min(MAX_WORKERS, len(order)) + 1):
@@ -186,6 +217,7 @@ def split(tests, secs):
             i = loads.index(min(loads))
             groups[i].append(n)
             loads[i] += secs[n]
+        _balance(groups, loads, secs)
         cost = max(loads) + WORKER_COST * k
         if best is None or cost < best[0]:
             best = (cost, groups)
