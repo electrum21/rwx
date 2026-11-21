@@ -36,10 +36,13 @@ out = {"files": {}, "fixtures": {}}
 
 import glob, os, re
 _children = {}
-for p in glob.glob(SRC + "/sqlglot/dialects/*.py"):
+for p in glob.glob(SRC + "/sqlglot/*/*.py"):
+    if p.split("/")[-2] not in ("dialects", "parsers", "generators", "typing", "tokenizers"):
+        continue
     me = os.path.basename(p)[:-3]
-    for m_ in re.finditer(r"from sqlglot\.dialects\.(\w+) import", open(p).read()):
-        _children.setdefault(m_.group(1), set()).add(me)
+    for m_ in re.finditer(r"from sqlglot\.(?:dialects|parsers|generators|typing|tokenizers)\.(\w+) import", open(p).read()):
+        if m_.group(1) not in ("dialect", "base", "__init__") and m_.group(1) != me:
+            _children.setdefault(m_.group(1), set()).add(me)
 def descendants(x):
     seen = {x}; todo = [x]
     while todo:
@@ -47,7 +50,7 @@ def descendants(x):
         for c in _children.get(y, ()):
             if c not in seen: seen.add(c); todo.append(c)
     return seen
-FAMDIRS = ("dialects", "parsers", "generators", "typing")
+FAMDIRS = ("dialects", "parsers", "generators", "typing", "tokenizers")
 def family_files(rel):
     parts = rel.split("/")
     if len(parts) == 3 and parts[1] in FAMDIRS and parts[2] not in ("__init__.py", "dialect.py"):
@@ -64,6 +67,16 @@ for tid, names in _inst.items():
         for n in names: INST[n].add(idnum[tid])
 # classes whose arg_types other modules read at import or by name
 ARG_TYPES_READ = {"Select", "TableFromRows", "MakeInterval"}
+
+_dial = json.load(open("/tmp/dial.json"))
+DIAL_IMPORT = set(_dial.pop("IMPORT", []))
+DIAL = {}
+for tid, ms in _dial.items():
+    if tid in idnum: DIAL[frozenset({idnum[tid]})] = set(ms)
+DIAL = {}
+for tid, ms in _dial.items():
+    if tid in idnum: DIAL.setdefault(idnum[tid], set()).update(ms)
+DIAL = {frozenset([k]): v for k, v in DIAL.items()}
 
 class Info:
     pass
@@ -155,6 +168,14 @@ def analyze(rel):
             u = set()
             for ff in fam:
                 for e in raw.get(ff, {}).values(): u |= e[0]
+            # every test that built a tokenizer/parser/generator/dialect of the
+            # family (MRO-based, so subclass dialects count too)
+            x = rel.split("/")[2][:-3]
+            mods = {f"sqlglot.{d}.{x}" for d in FAMDIRS}
+            for tid, ms in DIAL.items():
+                if mods & ms: u |= set(tid)
+            if mods & DIAL_IMPORT:
+                return ALL
             return u or ALL
         if rel.startswith(("sqlglot/optimizer/", "sqlglot/executor/")) and not rel.endswith("__init__.py"):
             return file_union or ALL
