@@ -21,9 +21,11 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 # Diagnostic builds only: commits whose selection used one of these rules
 # print no tests, so the board's misses and seconds measure those rules.
-PROBE_BLANK = set()
+WIDE_A = {"compile_fail", "unknown_pkg_file", "static_all", "test_helper", "testfile_whole",
+          "testfile_method", "fixture_guess", "unknown_path", "error"}
 WIDE = {"compile_fail", "unknown_pkg_file", "static_all", "test_helper", "testfile_whole",
         "testfile_method", "fixture_guess", "unknown_path", "error"}
+PROBE_BLANK = set(WIDE_A)  # PROBE A
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 NO_EFFECT = re.compile(
     r"^(\.github/|posts/|benchmarks/|pdoc/|docs/|sqlglotc/|sqlglot-integration-tests/)"
