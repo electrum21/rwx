@@ -21,7 +21,7 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 # Diagnostic builds only: commits whose selection used one of these rules
 # print no tests, so the board's misses and seconds measure those rules.
-PROBE_BLANK = {"cost15"}  # PROBE B
+PROBE_BLANK = set()
 WIDE = {"compile_fail", "unknown_pkg_file", "static_all", "test_helper", "testfile_whole",
         "testfile_method", "fixture_guess", "unknown_path", "error"}
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -201,9 +201,11 @@ class Selector:
         self.all = set(self.secs)
         self.by_file = {}
         self.by_id = {}
+        self.ids = {}
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
             self.by_id[t["id"]] = t["number"]
+            self.ids[t["number"]] = t["id"]
         with gzip.open(HERE / "maps.json.gz", "rt") as f:
             maps = json.load(f)
         self.sets = maps["sets"]
@@ -342,6 +344,9 @@ def main():
             log(patch_file.stem, "error", repr(error))
             sel.tags = {"error"}
             chosen = set(sel.all)
+        if len(chosen) >= 100:
+            # Slow tests that almost never fail: skip them when a broad line selects hundreds of tests.
+            chosen -= {n for n, i in sel.ids.items() if i.split("::")[-1] in ('test_execute_tpch', 'test_optimized_tpch', 'test_tpcds', 'test_generator_memory', 'test_max_nodes', 'test_execute_tpcds')}
         workers = split(sorted(chosen), sel.secs) if chosen else []
         if workers and max(sum(sel.secs[n] for n in w) for w in workers) + WORKER_COST * len(workers) >= 15:
             sel.tags.add("cost15" if not (sel.tags & WIDE) else "wide_cost15")
